@@ -1,10 +1,9 @@
 import math
 
-from einops import rearrange, parse_shape
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from einops import parse_shape, rearrange
 
 
 class Downsample(nn.Module):
@@ -19,7 +18,7 @@ class Downsample(nn.Module):
 class Upsample(nn.Module):
     def __init__(self, in_channels, out_channels):
         super().__init__()
-        self.up = nn.Upsample(scale_factor=2, mode='nearest')
+        self.up = nn.Upsample(scale_factor=2, mode="nearest")
         self.conv = nn.Conv2d(in_channels, out_channels, 3, padding=1)
 
     def forward(self, x):
@@ -41,13 +40,14 @@ class AttentionBlock(nn.Module):
     def forward(self, x):
         h = self.norm(x)
 
-        q = rearrange(self.Q(h), 'b c h w -> b (h w) c')
-        k = rearrange(self.K(h), 'b c h w -> b (h w) c')
-        v = rearrange(self.V(h), 'b c h w -> b (h w) c')
+        q = rearrange(self.Q(h), "b c h w -> b (h w) c")
+        k = rearrange(self.K(h), "b c h w -> b (h w) c")
+        v = rearrange(self.V(h), "b c h w -> b (h w) c")
 
         out = F.scaled_dot_product_attention(q, k, v)
-        out = rearrange(out, 'b (h w) c -> b c h w', **parse_shape(x, 'b c h w'))
+        out = rearrange(out, "b (h w) c -> b c h w", **parse_shape(x, "b c h w"))
         return x + self.proj(out)
+
 
 def make_skip_connection(dim_in, dim_out):
     if dim_in == dim_out:
@@ -62,28 +62,36 @@ def make_attn(dim_out, attn):
 
 
 def make_block(dim_in, dim_out, num_groups, dropout=0):
-    return nn.Sequential(nn.GroupNorm(num_groups=num_groups, num_channels=dim_in), 
-                         nn.SiLU(),
-                         nn.Dropout(dropout) if dropout != 0 else nn.Identity(),
-                         nn.Conv2d(dim_in, dim_out, 3, 1, 1))
+    return nn.Sequential(
+        nn.GroupNorm(num_groups=num_groups, num_channels=dim_in),
+        nn.SiLU(),
+        nn.Dropout(dropout) if dropout != 0 else nn.Identity(),
+        nn.Conv2d(dim_in, dim_out, 3, 1, 1),
+    )
 
 
 class ConditioningBlock(nn.Module):
     def __init__(self, dim_out, emb_dim, scale_shift=True):
         super().__init__()
         dim = 2 * dim_out if scale_shift else dim_out
-        self.proj = nn.Sequential(
-            nn.SiLU(),
-            nn.Linear(emb_dim, dim)
-        )
-    
+        self.proj = nn.Sequential(nn.SiLU(), nn.Linear(emb_dim, dim))
+
     def forward(self, emb):
         emb = self.proj(emb)[:, :, None, None]
         return emb
-    
+
 
 class ResBlock(nn.Module):
-    def __init__(self, dim_in, dim_out, emb_dim, scale_shift=True, num_groups=32, dropout=0.1, attn=False):
+    def __init__(
+        self,
+        dim_in,
+        dim_out,
+        emb_dim,
+        scale_shift=True,
+        num_groups=32,
+        dropout=0.1,
+        attn=False,
+    ):
         super().__init__()
         self.scale_shift = scale_shift
 
@@ -111,10 +119,17 @@ class ResBlock(nn.Module):
         return self.attn(h)
 
 
-def get_timestep_embedding(timesteps: torch.Tensor, embedding_dim: int, downscale_freq_shift: 'float' = 0, max_period: int = 10000):
-    assert len(timesteps.shape) == 1, 'Timesteps should be a 1d-array'
+def get_timestep_embedding(
+    timesteps: torch.Tensor,
+    embedding_dim: int,
+    downscale_freq_shift: "float" = 0,
+    max_period: int = 10000,
+):
+    assert len(timesteps.shape) == 1, "Timesteps should be a 1d-array"
     half_dim = embedding_dim // 2
-    exponent = -math.log(max_period) * torch.arange(start=0, end=half_dim, dtype=torch.float32, device=timesteps.device)
+    exponent = -math.log(max_period) * torch.arange(
+        start=0, end=half_dim, dtype=torch.float32, device=timesteps.device
+    )
     exponent = exponent / (half_dim - downscale_freq_shift)
     emb = torch.exp(exponent)
     emb = timesteps[:, None].float() * emb[None, :]

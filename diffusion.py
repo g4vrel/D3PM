@@ -1,35 +1,38 @@
-import numpy as np
+import math
+
 import torch
 import torch.nn.functional as F
+
+INV_SQRT2 = 1.0 / math.sqrt(2.0)
 
 
 def make_cosine_betas(timesteps):
     steps = torch.arange(timesteps + 1, dtype=torch.float64) / timesteps
-    alpha_bar = torch.cos((steps + 0.008) / 1.008 * np.pi / 2)
-    betas = torch.minimum(1 - alpha_bar[1:] / alpha_bar[:-1], 0.999 * torch.ones_like(alpha_bar)[:-1])
+    alpha_bar = torch.cos((steps + 0.008) / 1.008 * math.pi / 2)
+    betas = torch.minimum(
+        1 - alpha_bar[1:] / alpha_bar[:-1], 0.999 * torch.ones_like(alpha_bar)[:-1]
+    )
     return betas
 
 
-def categorical_kl_logits(logits1, logits2, eps=1e-6):
-    out = (
-        torch.softmax(logits1 + eps, dim=-1) 
-        * (
-            torch.log_softmax(logits1 + eps, dim=-1)
-            - torch.log_softmax(logits2 + eps, dim=-1)
-        )
-    )
-    return torch.sum(out, dim=-1)
+def categorical_kl_logits(p_logits, q_logits):
+    p_log = F.log_softmax(p_logits, dim=-1)
+    q_log = F.log_softmax(q_logits, dim=-1)
+
+    p = p_log.exp()
+
+    return torch.sum(p * (p_log - q_log), dim=-1)
 
 
 def meanflat(x):
     return x.mean(dim=tuple(range(1, len(x.shape))))
 
 
-class Diffusion:
-    def __init__(self, config, device='cuda'):
-        self.timesteps = config['timesteps']
-        self.K = int(config['K'])
-        self.hl_coeff = config['coeff']
+class UniformDiffusion:
+    def __init__(self, config, device="cuda"):
+        self.timesteps = config["timesteps"]
+        self.K = int(config["K"])
+        self.hl_coeff = config["coeff"]
         self.device = device
 
         self.betas = make_cosine_betas(self.timesteps).to(self.device)
@@ -45,16 +48,18 @@ class Diffusion:
             qbar.append(q)
         self.qbar = torch.stack(qbar, dim=0).to(self.device).float()
 
-        self.qt_T = self.qt.transpose(1, 2).to(self.device).float() # Used for computing q(X_t = x_t | X_{t-1}).
+        self.qt_T = (
+            self.qt.transpose(1, 2).to(self.device).float()
+        )  # Used for computing q(X_t = x_t | X_{t-1}).
         del self.qt
 
     def _get_transition_mat(self, t):
         bt = self.betas[t]
         mat = torch.zeros((self.K, self.K), dtype=torch.float64)
 
-        off_diag = torch.full((self.K - 1,),
-                              fill_value=bt / float(self.K),
-                              dtype=torch.float64)
+        off_diag = torch.full(
+            (self.K - 1,), fill_value=bt / float(self.K), dtype=torch.float64
+        )
 
         # All transitions allowed
         for diag in range(1, self.K + 1):
@@ -72,7 +77,7 @@ class Diffusion:
         return a[t - 1, x, :]
 
     def _clip_noise(self, noise):
-        return torch.clip(noise, min=torch.finfo(noise.dtype).tiny, max=1.0)
+        return torch.clip(noise, min=torch.finfo(noise.dtype).eps, max=1.0)
 
     def _at_onehot(self, a, t, x):
         return torch.matmul(x, a[t, None, None])
@@ -94,11 +99,11 @@ class Diffusion:
 
         # q(X_{t-1} | X_0 = x0)
         if not x0_logits:
-            fact2 = self._at(self.qbar, t-1, x0)
+            fact2 = self._at(self.qbar, t - 1, x0)
             tzero_logits = torch.log(F.one_hot(x0, self.K) + 1e-6)
         else:
             norm_x0 = F.softmax(x0, dim=-1)
-            fact2 = self._at_onehot(self.qbar, t-1, norm_x0)
+            fact2 = self._at_onehot(self.qbar, t - 1, norm_x0)
             tzero_logits = x0
 
         out = torch.log(fact1 + 1e-6) + torch.log(fact2 + 1e-6)
@@ -107,7 +112,7 @@ class Diffusion:
 
     def vb(self, true_logits, predicted_logits):
         kl = categorical_kl_logits(true_logits, predicted_logits)
-        kl = meanflat(kl) / np.log(2)
+        kl = meanflat(kl) * INV_SQRT2
         return kl
 
     def cross_entropy(self, x0, predicted_logits):
@@ -120,8 +125,8 @@ class Diffusion:
         predicted_logits = model(xt, t)
 
         vb_loss = self.vb(true_logits, predicted_logits)
-        ce = - self.cross_entropy(x0, predicted_logits)
-        ce = meanflat(ce) / np.log(2)
+        ce = -self.cross_entropy(x0, predicted_logits)
+        ce = meanflat(ce) * INV_SQRT2
 
         loss = vb_loss + self.hl_coeff * ce
         return loss.mean(), (vb_loss, ce)
