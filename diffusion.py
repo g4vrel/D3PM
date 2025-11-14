@@ -2,6 +2,8 @@ import math
 
 import torch
 import torch.nn.functional as F
+from omegaconf import DictConfig
+
 
 INV_SQRT2 = 1.0 / math.sqrt(2.0)
 
@@ -28,7 +30,17 @@ def meanflat(x):
     return x.mean(dim=tuple(range(1, len(x.shape))))
 
 
-class UniformDiffusion:
+class UniformQ:
+    def __init__(self, cfg: DictConfig):
+        self.timesteps = int(cfg.diffusion.timesteps)
+        self.K = int(cfg.diffusion.K)
+        self.hl_coeff = float(cfg.diffusion.ce_coeff)
+        self.device = cfg.device
+
+        self.betas = ...
+
+
+class Diffusion:
     def __init__(self, config, device="cuda"):
         self.timesteps = config["timesteps"]
         self.K = int(config["K"])

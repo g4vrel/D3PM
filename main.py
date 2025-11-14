@@ -6,15 +6,15 @@ import torch
 from omegaconf import DictConfig
 from torch.optim.lr_scheduler import LinearLR, SequentialLR
 
-from diffusion import Diffusion
+from diffusion import UniformQ
 from unet import Unet
 from utils import get_loaders, make_default_dirs
 
 
 def set_flags(cfg: DictConfig):
     """Set performance flags and seed."""
-    torch.manual_seed(str(cfg.seed))
-    np.random.seed(str(cfg.seed))
+    torch.manual_seed(int(cfg.seed))
+    np.random.seed(int(cfg.seed))
 
     torch.set_float32_matmul_precision("high")
     torch.backends.cudnn.benchmark = True
