@@ -6,7 +6,7 @@ import torch
 from omegaconf import DictConfig
 from torch.optim.lr_scheduler import LinearLR, SequentialLR
 
-from diffusion import UniformQ
+from modules.diffusion import UniformQ
 from unet import Unet
 from utils import get_loaders, make_im_grid
 
