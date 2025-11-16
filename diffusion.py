@@ -1,9 +1,9 @@
 import math
 
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from omegaconf import DictConfig
-
 
 INV_SQRT2 = 1.0 / math.sqrt(2.0)
 
@@ -30,126 +30,119 @@ def meanflat(x):
     return x.mean(dim=tuple(range(1, len(x.shape))))
 
 
-class UniformQ:
+def vb_loss(true_logits, predicted_logits):
+    kl = categorical_kl_logits(true_logits, predicted_logits)
+    kl = meanflat(kl) * INV_SQRT2
+    return kl
+
+
+def cross_entropy(x0, predicted_logits):
+    log_probs = F.log_softmax(predicted_logits, dim=-1)
+    x_onehot = F.one_hot(x0, predicted_logits.shape[-1])
+    return torch.sum(log_probs * x_onehot, dim=-1)
+
+
+class UniformQ(nn.Module):
     def __init__(self, cfg: DictConfig):
+        super().__init__()
         self.timesteps = int(cfg.diffusion.timesteps)
         self.K = int(cfg.diffusion.K)
         self.hl_coeff = float(cfg.diffusion.ce_coeff)
-        self.device = cfg.device
 
-        self.betas = ...
+        dtype = torch.float32
+        device = cfg.device
 
+        betas64 = make_cosine_betas(self.timesteps)  # (T,)
+        alphas64 = 1.0 - betas64
+        alpha_bar64 = torch.cumprod(alphas64, dim=0)  # (T,)
 
-class Diffusion:
-    def __init__(self, config, device="cuda"):
-        self.timesteps = config["timesteps"]
-        self.K = int(config["K"])
-        self.hl_coeff = config["coeff"]
-        self.device = device
+        alpha_bar64 = torch.cat(
+            [torch.ones(1, dtype=alphas64.dtype), alpha_bar64], dim=0
+        )  # (T+1,)
 
-        self.betas = make_cosine_betas(self.timesteps).to(self.device)
-        qt = [self._get_transition_mat(t) for t in range(self.timesteps)]
-        self.qt = torch.stack(qt, axis=0)
+        self.register_buffer("betas", betas64.to(device=device, dtype=dtype))
+        self.register_buffer("alpha_bar", alpha_bar64.to(device=device, dtype=dtype))
+        self.oh = lambda x: F.one_hot(x, self.K)
 
-        assert self.qt.shape == (self.timesteps, self.K, self.K)
+    @property
+    def T(self):
+        return self.timesteps
 
-        q = self.qt[0]
-        qbar = [q]
-        for t in range(1, self.timesteps):
-            q = q @ self.qt[t]
-            qbar.append(q)
-        self.qbar = torch.stack(qbar, dim=0).to(self.device).float()
+    def true_posterior_logits(self, x0, xt, t):
+        """Computes log q(x_{t-1} | x_t, x_0) = log q(x_t | x_{t-1}) + log q(x_{t-1} | x_0)."""
+        K = self.K
+        b = self.betas[t - 1]
+        ab = self.alpha_bar[t - 1]
 
-        self.qt_T = (
-            self.qt.transpose(1, 2).to(self.device).float()
-        )  # Used for computing q(X_t = x_t | X_{t-1}).
-        del self.qt
+        one_xt = self.oh(xt).to(self.betas.dtype)
+        one_x0 = self.oh(x0).to(self.betas.dtype)
 
-    def _get_transition_mat(self, t):
-        bt = self.betas[t]
-        mat = torch.zeros((self.K, self.K), dtype=torch.float64)
+        while b.ndim < one_xt.ndim:
+            b = b.unsqueeze(-1)
+            ab = ab.unsqueeze(-1)
 
-        off_diag = torch.full(
-            (self.K - 1,), fill_value=bt / float(self.K), dtype=torch.float64
-        )
+        q_xt_xtm1 = (1.0 - b) * one_xt + b * 1.0 / K
+        q_xtm1_x0 = ab * one_x0 + (1.0 - ab) / K
 
-        # All transitions allowed
-        for diag in range(1, self.K + 1):
-            mat += torch.diag(off_diag, diagonal=diag)
-            mat += torch.diag(off_diag, diagonal=-diag)
-            off_diag = off_diag[:-1]
+        eps = torch.finfo(q_xt_xtm1.dtype).tiny
+        log_q1 = torch.log(q_xt_xtm1.clamp_min(eps))
+        log_q2 = torch.log(q_xtm1_x0.clamp_min(eps))
+        return log_q1 + log_q2
 
-        diag = 1.0 - mat.sum(1)
-        mat += torch.diag(diag, diagonal=0)
-        return mat
+    def predicted_posterior_logits(self, pred_x0_logits, xt, t):
+        """Computes p_theta(x_{t-1} | x_t) under x0-parameterization."""
+        K = self.K
+        p0 = F.softmax(pred_x0_logits, dim=-1)
+        one_xt = self.oh(xt).to(self.betas.dtype)
 
-    def _at(self, a, t, x):
-        bs = t.shape[0]
-        t = t.reshape((bs, *[1] * (x.dim() - 1)))
-        return a[t - 1, x, :]
+        b = self.betas[t - 1]
+        ab = self.alpha_bar[t - 1]
 
-    def _clip_noise(self, noise):
-        return torch.clip(noise, min=torch.finfo(noise.dtype).eps, max=1.0)
+        while b.ndim < one_xt.ndim:
+            b = b.unsqueeze(-1)
+            ab = ab.unsqueeze(-1)
 
-    def _at_onehot(self, a, t, x):
-        return torch.matmul(x, a[t, None, None])
+        q_xt_xtm1 = (1.0 - b) * one_xt + b / K
+        q_xtm1_x0dist = ab * p0 + (1.0 - ab) / K
+
+        eps = torch.finfo(p0.dtype).tiny
+        log_q1 = torch.log(q_xt_xtm1.clamp_min(eps))
+        log_q2 = torch.log(q_xtm1_x0dist.clamp_min(eps))
+        return log_q1 + log_q2
 
     def q_sample(self, x0, t, noise):
-        p = self._at(self.qbar, t, x0)
-        logits = torch.log(p + 1e-6)
-        noise = self._clip_noise(noise)
-        gumbel_noise = -torch.log(-torch.log(noise))
+        ab = self.alpha_bar[t]
+        one_x0 = self.oh(x0)
 
-        return torch.argmax(logits + gumbel_noise, dim=-1)
+        while ab.dim() < one_x0.dim():
+            ab = ab.view(*ab.shape, 1)
 
-    def q_posterior_logits(self, x0, xt, t, x0_logits):
-        """Computes equation (3).
-        x0 is either the data or the logits predicted by the model."""
+        p = ab * one_x0 + (1.0 - ab) / self.K
 
-        # q(X_t = xt | X_{t-1})
-        fact1 = self._at(self.qt_T, t, xt)
+        eps = torch.finfo(noise.dtype).eps
+        n = noise.clamp(min=eps, max=1 - eps)
+        g = -torch.log(-torch.log(n))
 
-        # q(X_{t-1} | X_0 = x0)
-        if not x0_logits:
-            fact2 = self._at(self.qbar, t - 1, x0)
-            tzero_logits = torch.log(F.one_hot(x0, self.K) + 1e-6)
-        else:
-            norm_x0 = F.softmax(x0, dim=-1)
-            fact2 = self._at_onehot(self.qbar, t - 1, norm_x0)
-            tzero_logits = x0
+        xt = torch.argmax(torch.log(p.clamp_min(1e-12)) + g, dim=-1)
+        return xt
 
-        out = torch.log(fact1 + 1e-6) + torch.log(fact2 + 1e-6)
-        t_broadcast = t.reshape((t.shape[0], *[1] * (xt.dim())))
-        return torch.where(t_broadcast == 0, tzero_logits, out)
+    def loss_fn(self, model, x0):
+        t = torch.randint(1, self.T + 1, (x0.size(0),), device=x0.device)
+        noise = torch.rand((*x0.shape, self.K), device=x0.device)
 
-    def vb(self, true_logits, predicted_logits):
-        kl = categorical_kl_logits(true_logits, predicted_logits)
-        kl = meanflat(kl) * INV_SQRT2
-        return kl
+        xt = self.q_sample(x0, t, noise)
+        pred_x0 = model(xt, t)
 
-    def cross_entropy(self, x0, predicted_logits):
-        log_probs = F.log_softmax(predicted_logits, dim=-1)
-        x_onehot = F.one_hot(x0, predicted_logits.shape[-1])
-        return torch.sum(log_probs * x_onehot, dim=-1)
+        true_logits = self.true_posterior_logits(x0, xt, t)
+        pred_logits = self.predicted_posterior_logits(pred_x0, xt, t)
 
-    def compute_losses(self, model, x0, xt, t):
-        true_logits = self.q_posterior_logits(x0, xt, t, False)
-        predicted_logits = model(xt, t)
+        vb = vb_loss(true_logits, pred_logits)
+        ce = meanflat(-cross_entropy(x0, pred_x0)) * INV_SQRT2
 
-        vb_loss = self.vb(true_logits, predicted_logits)
-        ce = -self.cross_entropy(x0, predicted_logits)
-        ce = meanflat(ce) * INV_SQRT2
+        loss = vb + self.hl_coeff * ce
+        return loss.mean(), (vb, ce)
 
-        loss = vb_loss + self.hl_coeff * ce
-        return loss.mean(), (vb_loss, ce)
+    def forward(self, model, x0):
+        return self.loss_fn(model, x0)
 
-    def p_sample(self, model, xt, t, noise):
-        predicted_x0_logits = model(xt, t)
-        logits = self.q_posterior_logits(predicted_x0_logits, xt, t, True)
-
-        mask = (t != 0).to(xt.dtype).reshape(xt.shape[0], *([1] * (len(xt.shape))))
-        noise = self._clip_noise(noise)
-        gumbel_noise = -torch.log(-torch.log(noise))
-
-        sample = torch.argmax(logits + gumbel_noise * mask, dim=-1)
-        return sample
+    def p_sample(self): ...

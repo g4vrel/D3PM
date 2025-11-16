@@ -54,7 +54,7 @@ def train_step(
     cfg: DictConfig,
     step: int,
     epoch: int,
-    diffusion: Diffusion,
+    diffusion: UniformQ,
     model: Unet,
     optim: torch.optim.Optimizer,
     batch: Tuple[torch.Tensor, torch.Tensor],
@@ -68,11 +68,7 @@ def train_step(
     x = x.to(device)
     x = (x * K).long().clamp(0, K - 1)
 
-    t = torch.randint(0, T, (x.size(0),), device=x.device)
-    noise = torch.rand((*x.shape, K), device=x.device)
-
-    xt = diffusion.q_sample(x, t, noise)
-    loss, _ = diffusion.compute_losses(model, x, xt, t)
+    loss, _ = diffusion(model, x)
 
     optim.zero_grad(set_to_none=True)
     loss.backward()
