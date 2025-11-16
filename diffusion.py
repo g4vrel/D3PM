@@ -45,6 +45,7 @@ def cross_entropy(x0, predicted_logits):
 class UniformQ(nn.Module):
     def __init__(self, cfg: DictConfig):
         super().__init__()
+        self.debug = getattr(cfg, "debug", False)
         self.timesteps = int(cfg.diffusion.timesteps)
         self.K = int(cfg.diffusion.K)
         self.hl_coeff = float(cfg.diffusion.ce_coeff)
@@ -68,6 +69,13 @@ class UniformQ(nn.Module):
     def T(self):
         return self.timesteps
 
+    @staticmethod
+    def _dist_check(d1, d2):
+        assert (d1 >= -1e-7).all()
+        assert (d2 >= -1e-7).all()
+        assert torch.allclose(d1.sum(-1), torch.ones_like(d1[..., 0]), atol=1e-4)
+        assert torch.allclose(d2.sum(-1), torch.ones_like(d2[..., 0]), atol=1e-4)
+
     def true_posterior_logits(self, x0, xt, t):
         """Computes log q(x_{t-1} | x_t, x_0) = log q(x_t | x_{t-1}) + log q(x_{t-1} | x_0)."""
         K = self.K
@@ -83,6 +91,9 @@ class UniformQ(nn.Module):
 
         q_xt_xtm1 = (1.0 - b) * one_xt + b * 1.0 / K
         q_xtm1_x0 = ab * one_x0 + (1.0 - ab) / K
+
+        if getattr(self, "debug", False):
+            UniformQ._dist_check(q_xt_xtm1, q_xtm1_x0)
 
         eps = torch.finfo(q_xt_xtm1.dtype).tiny
         log_q1 = torch.log(q_xt_xtm1.clamp_min(eps))
@@ -104,6 +115,9 @@ class UniformQ(nn.Module):
 
         q_xt_xtm1 = (1.0 - b) * one_xt + b / K
         q_xtm1_x0dist = ab * p0 + (1.0 - ab) / K
+
+        if getattr(self, "debug", False):
+            UniformQ._dist_check(q_xt_xtm1, q_xtm1_x0dist)
 
         eps = torch.finfo(p0.dtype).tiny
         log_q1 = torch.log(q_xt_xtm1.clamp_min(eps))
@@ -140,9 +154,30 @@ class UniformQ(nn.Module):
         ce = meanflat(-cross_entropy(x0, pred_x0)) * INV_SQRT2
 
         loss = vb + self.hl_coeff * ce
-        return loss.mean(), (vb, ce)
+        return loss.mean(), (vb.mean(), ce.mean())
 
     def forward(self, model, x0):
         return self.loss_fn(model, x0)
 
-    def p_sample(self): ...
+    def p_sample(self, model, xt, t, noise):
+        """Sample x_{t-1} ~ p_theta(x_{t-1} | x_t)."""
+        pred_x0_logits = model(xt, t)  # (..., K)
+        logits = self.predicted_posterior_logits(pred_x0_logits, xt, t)
+
+        eps = torch.finfo(noise.dtype).eps
+        u = noise.clamp(min=eps, max=1 - eps)
+        g = -torch.log(-torch.log(u))
+
+        xtm1 = torch.argmax(logits + g, dim=-1)
+        return xtm1
+
+    @torch.inference_mode()
+    def p_sample_loop(self, model, shape, device):
+        xt = torch.randint(0, self.K, shape, device=device)
+
+        for t_int in reversed(range(1, self.T + 1)):
+            t = torch.full((xt.size(0),), t_int, device=device, dtype=torch.long)
+            noise = torch.rand((*xt.shape, self.K), device=device)
+            xt = self.p_sample(model, xt, t, noise)
+
+        return xt

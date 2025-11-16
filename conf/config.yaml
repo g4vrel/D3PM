@@ -1,19 +1,21 @@
 seed: 159753
 device: cuda
+debug: true
+gen_freq: 1
 
-compile: true
+compile: false
 
 diffusion:
   timesteps: 1000
-  K: 16
+  K: 8
   ce_coeff: 0.001
 
 trainer:
-  batch_size: 64
+  batch_size: 128
   min_lr: 1e-6
   max_lr: 5e-4
-  warmup_steps: 45000
-  epochs: 2000
+  warmup_steps: 1000
+  epochs: 200
   max_steps: 400000
   log_freq: 100
   accumulation_steps: 2
@@ -22,9 +24,8 @@ trainer:
 
 data:
   root: data/
-  img_size: 32
-  dataset: "cifar10"
-  download: false
+  img_size: 28
+  download: true
 
 sample:
-  size: 32
+  size: 28

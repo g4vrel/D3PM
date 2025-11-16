@@ -8,7 +8,7 @@ from torch.optim.lr_scheduler import LinearLR, SequentialLR
 
 from diffusion import UniformQ
 from unet import Unet
-from utils import get_loaders, make_default_dirs
+from utils import get_loaders, make_im_grid
 
 
 def set_flags(cfg: DictConfig):
@@ -68,36 +68,37 @@ def train_step(
     x = x.to(device)
     x = (x * K).long().clamp(0, K - 1)
 
-    loss, _ = diffusion(model, x)
+    loss, vb_ce = diffusion(model, x)
 
     optim.zero_grad(set_to_none=True)
     loss.backward()
     optim.step()
 
     if (step + 1) % int(cfg.trainer.log_freq) == 0:
-        print(f"Step: {step} ({epoch}) | Loss: {loss.item():.5f}")
+        vb, ce = vb_ce
+        print(
+            f"Step: {step} ({epoch}) | Loss: {loss.item():.5f} | VB: {vb.item():.5f} | CE: {ce.item():.5f}"
+        )
 
     return float(loss.detach())
 
 
-def eval_step(): ...
-
-
 @hydra.main(config_path="conf", config_name="config", version_base="1.3")
 def main(cfg: DictConfig):
+    set_flags(cfg)
     device = str(cfg.device)
 
-    diffusion = Diffusion(cfg, device)
+    diffusion = UniformQ(cfg)
     model = Unet(
         K=int(cfg.diffusion.K),
         in_ch=1,
-        ch=128,
+        ch=64,
         out_ch=1,
-        att_channels=[0, 1, 0, 0],
+        att_channels=[0, 0, 0, 0],
         groups=32,
     ).to(device)
 
-    if bool(cfg.compile):
+    if getattr(cfg, "compile", False):
         model = torch.compile(model)
 
     optim = get_optim(cfg, model)
@@ -112,6 +113,10 @@ def main(cfg: DictConfig):
                 cfg, step, epoch, diffusion, model, optim, batch, K, T, device
             )
             step += 1
+        with torch.inference_mode():
+            x0 = diffusion.p_sample_loop(model, (128, 1, 32, 32), device)
+            im = make_im_grid(x0, (16, 8), K)
+            im.save(f"{epoch}.png")
 
 
 if __name__ == "__main__":

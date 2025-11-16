@@ -1,2 +1,6 @@
 .venv
 .ruff_cache
+outputs/
+*.png
+__pycache__/
+data/
